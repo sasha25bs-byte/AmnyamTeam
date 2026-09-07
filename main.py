@@ -55,6 +55,9 @@ APPLY_STATE = {}  # chat_id -> {"step": "nick"/"game_id"/"role"/"screenshot"/"ti
 READY_WORDS = {"готов", "готова", "да", "гот", "+"}
 TAKE_WORDS = {"беру", "занимаю", "возьму", "займу"}
 
+DEFAULT_TEAM_NAME = "Amnyam Team"
+BOT_USERNAME = "Ammnyamm_bot"  # без @, используется как контакт для поиска игроков
+
 # ====================== БАЗА ДАННЫХ ======================
 
 
@@ -384,6 +387,7 @@ def cmd_help(message):
         "<b>/edit</b> — изменить турнир\n"
         "<b>/cancel_tournament</b> — отменить турнир\n"
         "<b>/find_players</b> — попросить админов найти прак/спарринг (напишу им в личку)\n"
+        "<b>/набор</b> — набор игроков в личке с ботом (искать прак / искать игрока)\n"
         "<b>/cancel</b> — прервать текущий ввод\n\n"
         "Тегаю состав за 20/15/10/5 минут до старта и сам ищу замену, если кто-то не подтвердился.",
     )
@@ -465,10 +469,36 @@ def cmd_find_players(message):
     bot.reply_to(message, "Как называется команда?")
 
 
+@bot.message_handler(commands=["набор"])
+def cmd_nabor(message):
+    if message.chat.type != "private":
+        bot.reply_to(message, "Команда /набор доступна только в личке с ботом — напиши мне в личные сообщения.")
+        return
+    if not require_captain(message):
+        return
+    if not ADMIN_USERNAMES:
+        bot.reply_to(message, "Список админов не настроен (ADMIN_USERNAMES пустой в коде).")
+        return
+    bot.reply_to(message, "Что делаем?", reply_markup=nabor_menu_keyboard())
+
+
 def subject_keyboard():
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("Прак", callback_data="find_subject:Прак"))
     kb.add(types.InlineKeyboardButton("Поиск игроков в команду", callback_data="find_subject:Поиск игроков в команду"))
+    return kb
+
+
+def nabor_menu_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🔍 Искать прак", callback_data="nabor:prak"))
+    kb.add(types.InlineKeyboardButton("🧩 Искать игрока", callback_data="nabor:player"))
+    return kb
+
+
+def prak_team_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("✏️ Изменить команду", callback_data="prak_edit_team"))
     return kb
 
 
@@ -567,12 +597,13 @@ def handle_edit_flow(message):
 
 
 def send_find_broadcast(chat_id, data):
-    text = (
-        f"🔎 Ищем: {data['subject']}\n"
-        f"Команда: {data['team']}\n"
-        f"🕒 Удобное время: {data['time']} (МСК)\n"
-        f"📩 Писать: {data['contact']}"
-    )
+    lines = [f"🔎 Ищем: {data['subject']}", f"Команда: {data['team']}"]
+    if data.get("format"):
+        lines.append(f"🎮 Формат: {data['format']}")
+    if data.get("time") and data["time"] != "—":
+        lines.append(f"🕒 Удобное время: {data['time']} (МСК)")
+    lines.append(f"📩 Писать: {data['contact']}")
+    text = "\n".join(lines)
 
     found, missing = get_admin_ids()
     sent, failed = [], []
@@ -607,6 +638,18 @@ def handle_find_flow(message):
         state["data"]["team"] = message.text.strip()
         state["step"] = "subject"
         bot.reply_to(message, "Что ищем?", reply_markup=subject_keyboard())
+        return
+
+    if state["step"] == "team_edit":
+        state["data"]["team"] = message.text.strip()
+        state["step"] = "format"
+        bot.reply_to(message, f"Команда обновлена: {state['data']['team']}\nКакой формат желателен? (например: bo1, bo3, 5x5)")
+        return
+
+    if state["step"] == "format":
+        state["data"]["format"] = message.text.strip()
+        state["step"] = "time"
+        bot.reply_to(message, "Во сколько удобно? (по МСК)")
         return
 
     if state["step"] == "time":
@@ -868,6 +911,50 @@ def handle_callback(call):
         state["step"] = "time"
         bot.edit_message_text(f"Что ищем: {subject}", call.message.chat.id, call.message.message_id)
         bot.send_message(call.message.chat.id, "Какое время удобно? (по МСК)")
+        bot.answer_callback_query(call.id)
+
+    elif data == "nabor:prak":
+        if not is_captain_username(call.from_user.username):
+            bot.answer_callback_query(call.id, "🚫 Доступно только капитанам", show_alert=True)
+            return
+        FIND_STATE[call.message.chat.id] = {
+            "step": "format",
+            "data": {"subject": "Прак", "team": DEFAULT_TEAM_NAME},
+        }
+        bot.edit_message_text(
+            f"🔍 Ищем прак\nКоманда: {DEFAULT_TEAM_NAME}",
+            call.message.chat.id, call.message.message_id,
+            reply_markup=prak_team_keyboard(),
+        )
+        bot.send_message(call.message.chat.id, "Какой формат желателен? (например: bo1, bo3, 5x5)")
+        bot.answer_callback_query(call.id)
+
+    elif data == "prak_edit_team":
+        if not is_captain_username(call.from_user.username):
+            bot.answer_callback_query(call.id, "🚫 Доступно только капитанам", show_alert=True)
+            return
+        state = FIND_STATE.get(call.message.chat.id)
+        if not state or "team" not in state.get("data", {}):
+            bot.answer_callback_query(call.id, "Сессия сброшена, начни заново через /набор", show_alert=True)
+            return
+        state["step"] = "team_edit"
+        bot.send_message(call.message.chat.id, "Введи новое название команды:")
+        bot.answer_callback_query(call.id)
+
+    elif data == "nabor:player":
+        if not is_captain_username(call.from_user.username):
+            bot.answer_callback_query(call.id, "🚫 Доступно только капитанам", show_alert=True)
+            return
+        bot.edit_message_text("🧩 Ищем игроков в команду", call.message.chat.id, call.message.message_id)
+        send_find_broadcast(
+            call.message.chat.id,
+            {
+                "subject": "Поиск игроков в команду",
+                "team": DEFAULT_TEAM_NAME,
+                "time": "—",
+                "contact": f"@{BOT_USERNAME}",
+            },
+        )
         bot.answer_callback_query(call.id)
 
 
