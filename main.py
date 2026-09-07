@@ -38,8 +38,22 @@ ADMIN_USERNAMES = {"admin_username_1", "admin_username_2"}  # <-- впиши с�
 # Дальше капитанов и админов-новостников удобнее добавлять/убирать через /admin — без правки кода.
 CAPTAIN_USERNAMES = set()  # <-- например {"my_username", "second_captain"}
 
+
+def _parse_username_env(var_name):
+    """Читает переменную окружения вида 'user1, user2, @user3' и возвращает множество юзернеймов."""
+    raw = os.getenv(var_name, "")
+    return {u.lstrip("@").lower() for u in raw.replace(";", ",").split(",") if u.strip()}
+
+
+# На Railway (или любом сервере) можно вместо правки кода задать переменные окружения:
+# CAPTAIN_USERNAMES="user1,user2"  и  ADMIN_USERNAMES="user3,user4"
+# (через запятую, без @, регистр не важен). Они подмешиваются к спискам выше и заносятся
+# в базу при самом первом запуске — дальше управление идёт через /admin.
+CAPTAIN_USERNAMES = CAPTAIN_USERNAMES | _parse_username_env("CAPTAIN_USERNAMES")
+ADMIN_USERNAMES = ADMIN_USERNAMES | _parse_username_env("ADMIN_USERNAMES")
+
 # Пароль для входа в панель администратора (команда /admin). Можно переопределить
-# переменной окружения ADMIN_PANEL_PASSWORD, чтобы не хранить его в коде.
+# переменной окружения ADMIN_PANEL_PASSWORD на Railway, чтобы не хранить его в коде.
 ADMIN_PANEL_PASSWORD = os.getenv("ADMIN_PANEL_PASSWORD", "Londys")
 
 if not BOT_TOKEN:
@@ -122,6 +136,12 @@ def init_db():
             )"""
         )
         conn.execute(
+            """CREATE TABLE IF NOT EXISTS captain_ids (
+                username TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL
+            )"""
+        )
+        conn.execute(
             """CREATE TABLE IF NOT EXISTS captains (
                 username TEXT PRIMARY KEY
             )"""
@@ -160,6 +180,9 @@ def init_db():
                 timezone TEXT,
                 from_username TEXT,
                 from_user_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                decided_by TEXT,
+                decided_at TEXT,
                 created_at TEXT NOT NULL
             )"""
         )
@@ -173,6 +196,20 @@ def init_db():
                 created_at TEXT NOT NULL
             )"""
         )
+        conn.commit()
+
+    # Миграция для баз, созданных до появления одобрения/отклонения заявок —
+    # добавляем недостающие колонки в уже существующую таблицу applications.
+    with db_lock, db_conn() as conn:
+        for col, coldef in (
+            ("status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("decided_by", "TEXT"),
+            ("decided_at", "TEXT"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE applications ADD COLUMN {col} {coldef}")
+            except sqlite3.OperationalError:
+                pass  # колонка уже существует
         conn.commit()
 
     # Однократный посев начальных капитанов/админов-новостников из констант в коде,
@@ -293,6 +330,29 @@ def remember_admin_id(username, user_id):
     with db_lock, db_conn() as conn:
         conn.execute("INSERT OR REPLACE INTO admin_ids (username, user_id) VALUES (?, ?)", (username.lower(), user_id))
         conn.commit()
+
+
+def remember_captain_id(username, user_id):
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO captain_ids (username, user_id) VALUES (?, ?)", (username.lower(), user_id)
+        )
+        conn.commit()
+
+
+def get_captain_ids():
+    """Возвращает список (username, user_id) для капитанов (таблица captains), чей ID уже известен."""
+    with db_lock, db_conn() as conn:
+        rows = conn.execute("SELECT username, user_id FROM captain_ids").fetchall()
+    known = {r["username"]: r["user_id"] for r in rows}
+    found, missing = [], []
+    for cap in get_captains():
+        key = cap.lstrip("@").lower()
+        if key in known:
+            found.append((key, known[key]))
+        else:
+            missing.append(key)
+    return found, missing
 
 
 def get_admin_ids():
@@ -473,7 +533,7 @@ def remove_clan_match(mid):
 
 def save_application(data, from_username, from_user_id):
     with db_lock, db_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO applications (nick, game_id, role, timezone, from_username, from_user_id, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
@@ -482,6 +542,7 @@ def save_application(data, from_username, from_user_id):
             ),
         )
         conn.commit()
+        return cur.lastrowid
 
 
 def get_applications(limit=15):
@@ -490,6 +551,21 @@ def get_applications(limit=15):
             "SELECT * FROM applications ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_application(app_id):
+    with db_lock, db_conn() as conn:
+        row = conn.execute("SELECT * FROM applications WHERE id = ?", (app_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def update_application_status(app_id, status, decided_by):
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            "UPDATE applications SET status = ?, decided_by = ?, decided_at = ? WHERE id = ?",
+            (status, decided_by, datetime.now().strftime(DT_FORMAT), app_id),
+        )
+        conn.commit()
 
 
 # ====================== ПЛАНИРОВЩИК ======================
@@ -642,6 +718,8 @@ def cmd_help(message):
     if message.chat.type == "private" and message.from_user and message.from_user.username:
         if message.from_user.username.lower() in get_news_admins():
             remember_admin_id(message.from_user.username, message.from_user.id)
+        if message.from_user.username.lower() in get_captains():
+            remember_captain_id(message.from_user.username, message.from_user.id)
 
     # Диплинк из мини-приложения: https://t.me/<bot>?start=apply
     args = message.text.split(maxsplit=1)
@@ -670,9 +748,7 @@ def start_application(message):
     bot.send_message(
         message.chat.id,
         "📋 <b>Заявка в клан Amnyam Team</b>\n\n"
-        "Мне нужно от тебя: ник, ID аккаунта, желаемая роль, скриншот статы из игры и часовой пояс.\n"
-        "Идём по порядку — сначала ник.\n\n"
-        "Как твой ник в игре?",
+        "Ваш ник:",
     )
 
 
@@ -809,6 +885,8 @@ def track_seen_user(bot_instance, message):
         remember_user(message.chat.id, username)
         if username.lower() in get_news_admins():
             remember_admin_id(username, message.from_user.id)
+        if username.lower() in get_captains():
+            remember_captain_id(username, message.from_user.id)
 
 
 @bot.message_handler(func=lambda m: m.chat.id in NEW_STATE and not m.text.startswith("/"), content_types=["text"])
@@ -950,7 +1028,7 @@ def handle_find_flow(message):
     if state["step"] == "time":
         state["data"]["time"] = message.text.strip()
         state["step"] = "contact"
-        bot.reply_to(message, "Кому писать / куда обращаться по этому вопросу?")
+        bot.reply_to(message, "Укажите юзернейм для связи")
         return
 
     if state["step"] == "contact":
@@ -1005,8 +1083,17 @@ def handle_apply_flow_photo(message):
     bot.send_message(message.chat.id, "Принял скриншот. Какой у тебя часовой пояс? (например: МСК, МСК+2)")
 
 
+def application_decision_keyboard(app_id):
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("✅ Одобрить", callback_data=f"app:approve:{app_id}"),
+        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"app:decline:{app_id}"),
+    )
+    return kb
+
+
 def send_application(message, data):
-    save_application(data, message.from_user.username, message.from_user.id)
+    app_id = save_application(data, message.from_user.username, message.from_user.id)
     caption = (
         f"📥 <b>Новая заявка в клан</b>\n"
         f"Ник: {data['nick']}\n"
@@ -1015,27 +1102,85 @@ def send_application(message, data):
         f"Часовой пояс: {data['timezone']}\n"
         f"От: @{message.from_user.username or '—'} (id {message.from_user.id})"
     )
+    kb = application_decision_keyboard(app_id)
 
-    found, missing = get_admin_ids()
+    # Заявку получают капитаны (им и решать) и, на всякий случай, админы-новостники.
+    recipients = {}
+    for username, uid in get_captain_ids()[0]:
+        recipients[uid] = username
+    for username, uid in get_admin_ids()[0]:
+        recipients.setdefault(uid, username)
+
     sent = []
-    for username, admin_id in found:
+    for uid, username in recipients.items():
         try:
             if data.get("screenshot_file_id"):
-                bot.send_photo(admin_id, data["screenshot_file_id"], caption=caption)
+                bot.send_photo(uid, data["screenshot_file_id"], caption=caption, reply_markup=kb)
             else:
-                bot.send_message(admin_id, caption)
+                bot.send_message(uid, caption, reply_markup=kb)
             sent.append(username)
         except Exception:
             pass
 
     if sent:
-        bot.send_message(message.chat.id, "✅ Заявка отправлена! Ждите ответа от админов клана.")
+        bot.send_message(message.chat.id, "✅ Заявка отправлена! Ждите ответа от капитанов клана.")
     else:
         bot.send_message(
             message.chat.id,
-            "⚠️ Не получилось никому отправить заявку — админы ещё не писали боту. "
+            "⚠️ Не получилось никому отправить заявку — капитаны и админы ещё не писали боту. "
             "Попробуй написать в общий чат команды напрямую.",
         )
+
+
+def handle_application_decision(call):
+    _, action, app_id_s = call.data.split(":")
+    app_id = int(app_id_s)
+    username = (call.from_user.username or "").lower()
+    allowed = is_captain_username(username) or username in get_news_admins()
+    if not allowed:
+        bot.answer_callback_query(call.id, "🚫 Доступно только капитанам/админам", show_alert=True)
+        return
+
+    app = get_application(app_id)
+    if not app:
+        bot.answer_callback_query(call.id, "Заявка не найдена", show_alert=True)
+        return
+    if app["status"] != "pending":
+        label = "уже одобрена ✅" if app["status"] == "approved" else "уже отклонена ❌"
+        bot.answer_callback_query(call.id, f"Эта заявка {label}", show_alert=True)
+        return
+
+    status = "approved" if action == "approve" else "declined"
+    decided_by = call.from_user.username or str(call.from_user.id)
+    update_application_status(app_id, status, decided_by)
+    log_admin_action(
+        call.from_user.username, call.from_user.id,
+        "Одобрена заявка" if status == "approved" else "Отклонена заявка",
+        f"#{app_id} {app['nick']}",
+    )
+
+    decided_line = f"\n\n{'✅ ОДОБРЕНА' if status == 'approved' else '❌ ОТКЛОНЕНА'} — @{decided_by}"
+    try:
+        if call.message.content_type == "photo":
+            bot.edit_message_caption(
+                (call.message.caption or "") + decided_line, call.message.chat.id, call.message.message_id
+            )
+        else:
+            bot.edit_message_text(
+                (call.message.text or "") + decided_line, call.message.chat.id, call.message.message_id
+            )
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id, "Готово")
+
+    if app["from_user_id"]:
+        try:
+            if status == "approved":
+                bot.send_message(app["from_user_id"], "✅ Твоя заявка в клан одобрена! Скоро с тобой свяжутся.")
+            else:
+                bot.send_message(app["from_user_id"], "❌ Твоя заявка в клан отклонена.")
+        except Exception:
+            pass
 
 
 # ====================== АДМИН-ПАНЕЛЬ (/admin) ======================
@@ -1121,11 +1266,13 @@ def format_applications_text():
     apps = get_applications(15)
     if not apps:
         return "📥 Заявок пока нет."
+    status_labels = {"pending": "⏳ ожидает", "approved": "✅ одобрена", "declined": "❌ отклонена"}
     lines = ["📥 <b>Последние заявки в клан</b> (последние 15):"]
     for a in apps:
+        status = status_labels.get(a.get("status", "pending"), a.get("status", "—"))
         lines.append(
             f"#{a['id']} · {a['created_at']} · {a['nick'] or '—'} (ID {a['game_id'] or '—'}) · "
-            f"роль: {a['role'] or '—'} · пояс: {a['timezone'] or '—'} · от @{a['from_username'] or '—'}"
+            f"роль: {a['role'] or '—'} · пояс: {a['timezone'] or '—'} · от @{a['from_username'] or '—'} · {status}"
         )
     return "\n".join(lines)
 
@@ -1557,6 +1704,10 @@ def handle_callback(call):
 
     if data.startswith("adm:"):
         handle_admin_callback(call)
+        return
+
+    if data.startswith("app:"):
+        handle_application_decision(call)
         return
 
     if data.startswith("ready:"):
