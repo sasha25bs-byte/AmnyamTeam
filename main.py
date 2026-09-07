@@ -34,7 +34,13 @@ ADMIN_USERNAMES = {"admin_username_1", "admin_username_2"}  # <-- впиши с�
 
 # Юзернеймы капитанов (без @), которым доступны команды управления турнирами и рассылка.
 # Если оставить пустым множество (set()) — командами сможет пользоваться кто угодно в чате.
+# ВАЖНО: это только НАЧАЛЬНЫЙ список для первого запуска (заносится в базу один раз).
+# Дальше капитанов и админов-новостников удобнее добавлять/убирать через /admin — без правки кода.
 CAPTAIN_USERNAMES = set()  # <-- например {"my_username", "second_captain"}
+
+# Пароль для входа в панель администратора (команда /admin). Можно переопределить
+# переменной окружения ADMIN_PANEL_PASSWORD, чтобы не хранить его в коде.
+ADMIN_PANEL_PASSWORD = os.getenv("ADMIN_PANEL_PASSWORD", "Londys")
 
 if not BOT_TOKEN:
     raise RuntimeError(
@@ -51,6 +57,11 @@ NEW_STATE = {}   # chat_id -> {"step": "name"/"datetime"/"roster", "data": {...}
 FIND_STATE = {}  # chat_id -> {"step": "time"/"format", "data": {...}}
 EDIT_STATE = {}  # chat_id -> {"tournament_id": int, "field": str}
 APPLY_STATE = {}  # chat_id -> {"step": "nick"/"game_id"/"role"/"screenshot"/"timezone", "data": {...}}
+
+# Состояния админ-панели (по user_id, а не chat_id — работает и в личке, и в группе)
+ADMIN_SESSIONS = set()     # user_id тех, кто сейчас в режиме админа
+ADMIN_LOGIN_PENDING = set()  # user_id тех, кто написал /admin и должен прислать пароль
+ADMIN_STATE = {}           # user_id -> {"action": str, "data": {...}} — многошаговые сценарии панели
 
 READY_WORDS = {"готов", "готова", "да", "гот", "+"}
 TAKE_WORDS = {"беру", "занимаю", "возьму", "займу"}
@@ -110,6 +121,75 @@ def init_db():
                 user_id INTEGER NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS captains (
+                username TEXT PRIMARY KEY
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS news_admins (
+                username TEXT PRIMARY KEY
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS clan_roster (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nick TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'Игрок',
+                kills INTEGER NOT NULL DEFAULT 0,
+                deaths INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS clan_matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                opponent TEXT NOT NULL,
+                match_date TEXT NOT NULL,
+                score_us INTEGER NOT NULL,
+                score_them INTEGER NOT NULL,
+                result TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nick TEXT,
+                game_id TEXT,
+                role TEXT,
+                timezone TEXT,
+                from_username TEXT,
+                from_user_id INTEGER,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS admin_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_username TEXT,
+                actor_id INTEGER,
+                action TEXT NOT NULL,
+                details TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.commit()
+
+    # Однократный посев начальных капитанов/админов-новостников из констант в коде,
+    # если таблицы ещё пустые. Дальше ими управляют через /admin, без правки кода.
+    with db_lock, db_conn() as conn:
+        cnt = conn.execute("SELECT COUNT(*) AS c FROM captains").fetchone()["c"]
+        if cnt == 0 and CAPTAIN_USERNAMES:
+            for u in CAPTAIN_USERNAMES:
+                conn.execute(
+                    "INSERT OR IGNORE INTO captains (username) VALUES (?)", (u.lstrip("@").lower(),)
+                )
+        cnt = conn.execute("SELECT COUNT(*) AS c FROM news_admins").fetchone()["c"]
+        if cnt == 0 and ADMIN_USERNAMES:
+            for u in ADMIN_USERNAMES:
+                conn.execute(
+                    "INSERT OR IGNORE INTO news_admins (username) VALUES (?)", (u.lstrip("@").lower(),)
+                )
         conn.commit()
 
 
@@ -216,18 +296,200 @@ def remember_admin_id(username, user_id):
 
 
 def get_admin_ids():
-    """Возвращает список (username, user_id) для тех админов из ADMIN_USERNAMES, чей ID уже известен."""
+    """Возвращает список (username, user_id) для админов-новостников (таблица news_admins), чей ID уже известен."""
     with db_lock, db_conn() as conn:
         rows = conn.execute("SELECT username, user_id FROM admin_ids").fetchall()
     known = {r["username"]: r["user_id"] for r in rows}
     found, missing = [], []
-    for admin in ADMIN_USERNAMES:
+    for admin in get_news_admins():
         key = admin.lstrip("@").lower()
         if key in known:
             found.append((key, known[key]))
         else:
             missing.append(key)
     return found, missing
+
+
+def log_admin_action(actor_username, actor_id, action, details=""):
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            "INSERT INTO admin_logs (actor_username, actor_id, action, details, created_at) VALUES (?, ?, ?, ?, ?)",
+            (actor_username or "—", actor_id, action, details, datetime.now().strftime(DT_FORMAT)),
+        )
+        conn.commit()
+
+
+def get_admin_logs(limit=20):
+    with db_lock, db_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM admin_logs ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------- Капитаны / админы-новостники (динамические, через /admin) ----------
+
+
+def get_captains():
+    with db_lock, db_conn() as conn:
+        rows = conn.execute("SELECT username FROM captains ORDER BY username").fetchall()
+        return [r["username"] for r in rows]
+
+
+def add_captain(username):
+    username = username.lstrip("@").lower()
+    with db_lock, db_conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO captains (username) VALUES (?)", (username,))
+        conn.commit()
+    return username
+
+
+def remove_captain(username):
+    username = username.lstrip("@").lower()
+    with db_lock, db_conn() as conn:
+        conn.execute("DELETE FROM captains WHERE username = ?", (username,))
+        conn.commit()
+    return username
+
+
+def get_news_admins():
+    with db_lock, db_conn() as conn:
+        rows = conn.execute("SELECT username FROM news_admins ORDER BY username").fetchall()
+        return [r["username"] for r in rows]
+
+
+def add_news_admin(username):
+    username = username.lstrip("@").lower()
+    with db_lock, db_conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO news_admins (username) VALUES (?)", (username,))
+        conn.commit()
+    return username
+
+
+def remove_news_admin(username):
+    username = username.lstrip("@").lower()
+    with db_lock, db_conn() as conn:
+        conn.execute("DELETE FROM news_admins WHERE username = ?", (username,))
+        conn.commit()
+    return username
+
+
+# ---------- Ростер клана (для мини-аппа/табло: ники, роли, киллы/смерти) ----------
+
+
+def get_clan_roster():
+    with db_lock, db_conn() as conn:
+        rows = conn.execute("SELECT * FROM clan_roster ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+
+
+def add_clan_player(nick, role):
+    with db_lock, db_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO clan_roster (nick, role, kills, deaths) VALUES (?, ?, 0, 0)", (nick, role)
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def remove_clan_player(pid):
+    with db_lock, db_conn() as conn:
+        conn.execute("DELETE FROM clan_roster WHERE id = ?", (pid,))
+        conn.commit()
+
+
+def get_clan_player(pid):
+    with db_lock, db_conn() as conn:
+        row = conn.execute("SELECT * FROM clan_roster WHERE id = ?", (pid,)).fetchone()
+        return dict(row) if row else None
+
+
+def set_clan_player_role(pid, role):
+    with db_lock, db_conn() as conn:
+        conn.execute("UPDATE clan_roster SET role = ? WHERE id = ?", (role, pid))
+        conn.commit()
+
+
+def set_clan_player_kd(pid, kills, deaths):
+    with db_lock, db_conn() as conn:
+        conn.execute("UPDATE clan_roster SET kills = ?, deaths = ? WHERE id = ?", (kills, deaths, pid))
+        conn.commit()
+
+
+def add_clan_player_kd(pid, kills_delta, deaths_delta):
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            "UPDATE clan_roster SET kills = kills + ?, deaths = deaths + ? WHERE id = ?",
+            (kills_delta, deaths_delta, pid),
+        )
+        conn.commit()
+
+
+# ---------- История матчей клана (для мини-аппа/табло) ----------
+
+
+def get_clan_matches():
+    with db_lock, db_conn() as conn:
+        rows = conn.execute("SELECT * FROM clan_matches ORDER BY id DESC").fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_clan_match(mid):
+    with db_lock, db_conn() as conn:
+        row = conn.execute("SELECT * FROM clan_matches WHERE id = ?", (mid,)).fetchone()
+        return dict(row) if row else None
+
+
+def add_clan_match(opponent, match_date, score_us, score_them):
+    result = "win" if score_us > score_them else "loss"
+    with db_lock, db_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO clan_matches (opponent, match_date, score_us, score_them, result, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (opponent, match_date, score_us, score_them, result, datetime.now().strftime(DT_FORMAT)),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def update_clan_match_field(mid, field, value):
+    with db_lock, db_conn() as conn:
+        conn.execute(f"UPDATE clan_matches SET {field} = ? WHERE id = ?", (value, mid))
+        m = conn.execute("SELECT * FROM clan_matches WHERE id = ?", (mid,)).fetchone()
+        if m:
+            result = "win" if m["score_us"] > m["score_them"] else "loss"
+            conn.execute("UPDATE clan_matches SET result = ? WHERE id = ?", (result, mid))
+        conn.commit()
+
+
+def remove_clan_match(mid):
+    with db_lock, db_conn() as conn:
+        conn.execute("DELETE FROM clan_matches WHERE id = ?", (mid,))
+        conn.commit()
+
+
+# ---------- Заявки в клан (дубль истории — оригиналы всё равно летят в личку админам) ----------
+
+
+def save_application(data, from_username, from_user_id):
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            "INSERT INTO applications (nick, game_id, role, timezone, from_username, from_user_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                data.get("nick"), data.get("game_id"), data.get("role"), data.get("timezone"),
+                from_username, from_user_id, datetime.now().strftime(DT_FORMAT),
+            ),
+        )
+        conn.commit()
+
+
+def get_applications(limit=15):
+    with db_lock, db_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM applications ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # ====================== ПЛАНИРОВЩИК ======================
@@ -349,17 +611,19 @@ def tournaments_keyboard(tournaments, prefix):
 
 
 def is_captain(message):
-    """Если CAPTAIN_USERNAMES пуст — доступ разрешён всем."""
-    if not CAPTAIN_USERNAMES:
+    """Если список капитанов пуст — доступ разрешён всем."""
+    captains = get_captains()
+    if not captains:
         return True
     username = (message.from_user.username or "").lower()
-    return username in {c.lstrip("@").lower() for c in CAPTAIN_USERNAMES}
+    return username in captains
 
 
 def is_captain_username(username):
-    if not CAPTAIN_USERNAMES:
+    captains = get_captains()
+    if not captains:
         return True
-    return (username or "").lower() in {c.lstrip("@").lower() for c in CAPTAIN_USERNAMES}
+    return (username or "").lower() in captains
 
 
 def require_captain(message):
@@ -376,7 +640,7 @@ def require_captain(message):
 def cmd_help(message):
     # Если это админ написал боту в личку — сразу запоминаем его ID, чтобы могли слать ему рассылку
     if message.chat.type == "private" and message.from_user and message.from_user.username:
-        if message.from_user.username.lower() in {a.lstrip("@").lower() for a in ADMIN_USERNAMES}:
+        if message.from_user.username.lower() in get_news_admins():
             remember_admin_id(message.from_user.username, message.from_user.id)
 
     # Диплинк из мини-приложения: https://t.me/<bot>?start=apply
@@ -395,7 +659,8 @@ def cmd_help(message):
         "<b>/find_players</b> — попросить админов найти прак/спарринг (напишу им в личку)\n"
         "<b>/новость</b> — в личке с ботом: искать прак / искать игрока (для капитанов)\n"
         "<b>/набор</b> — подать заявку в команду (в личке: через ЛС-анкету или мини-апп)\n"
-        "<b>/cancel</b> — прервать текущий ввод\n\n"
+        "<b>/cancel</b> — прервать текущий ввод\n"
+        "<b>/admin</b> — панель администратора (по паролю)\n\n"
         "Тегаю состав за 20/15/10/5 минут до старта и сам ищу замену, если кто-то не подтвердился.",
     )
 
@@ -417,6 +682,9 @@ def cmd_cancel(message):
     EDIT_STATE.pop(message.chat.id, None)
     FIND_STATE.pop(message.chat.id, None)
     APPLY_STATE.pop(message.chat.id, None)
+    if message.from_user:
+        ADMIN_STATE.pop(message.from_user.id, None)
+        ADMIN_LOGIN_PENDING.discard(message.from_user.id)
     bot.reply_to(message, "Ок, отменил ввод.")
 
 
@@ -469,8 +737,8 @@ def cmd_cancel_tournament(message):
 def cmd_find_players(message):
     if not require_captain(message):
         return
-    if not ADMIN_USERNAMES:
-        bot.reply_to(message, "Список админов не настроен (ADMIN_USERNAMES пустой в коде).")
+    if not get_news_admins():
+        bot.reply_to(message, "Список админов-новостников не настроен. Добавь через /admin.")
         return
     FIND_STATE[message.chat.id] = {"step": "team", "data": {}}
     bot.reply_to(message, "Как называется команда?")
@@ -483,8 +751,8 @@ def cmd_news(message):
         return
     if not require_captain(message):
         return
-    if not ADMIN_USERNAMES:
-        bot.reply_to(message, "Список админов не настроен (ADMIN_USERNAMES пустой в коде).")
+    if not get_news_admins():
+        bot.reply_to(message, "Список админов-новостников не настроен. Добавь через /admin.")
         return
     bot.reply_to(message, "Что делаем?", reply_markup=news_menu_keyboard())
 
@@ -539,7 +807,7 @@ def track_seen_user(bot_instance, message):
     if message.content_type == "text" and message.from_user and message.from_user.username:
         username = message.from_user.username
         remember_user(message.chat.id, username)
-        if username.lower() in {a.lstrip("@").lower() for a in ADMIN_USERNAMES}:
+        if username.lower() in get_news_admins():
             remember_admin_id(username, message.from_user.id)
 
 
@@ -738,6 +1006,7 @@ def handle_apply_flow_photo(message):
 
 
 def send_application(message, data):
+    save_application(data, message.from_user.username, message.from_user.id)
     caption = (
         f"📥 <b>Новая заявка в клан</b>\n"
         f"Ник: {data['nick']}\n"
@@ -767,6 +1036,472 @@ def send_application(message, data):
             "⚠️ Не получилось никому отправить заявку — админы ещё не писали боту. "
             "Попробуй написать в общий чат команды напрямую.",
         )
+
+
+# ====================== АДМИН-ПАНЕЛЬ (/admin) ======================
+
+
+def admin_menu_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("👑 Капитаны", callback_data="adm:captains"))
+    kb.add(types.InlineKeyboardButton("📰 Админы-новостники", callback_data="adm:news"))
+    kb.add(types.InlineKeyboardButton("📥 Заявки в клан", callback_data="adm:apps"))
+    kb.add(types.InlineKeyboardButton("🧑‍🤝‍🧑 Ростер клана", callback_data="adm:roster"))
+    kb.add(types.InlineKeyboardButton("📊 Матчи", callback_data="adm:matches"))
+    kb.add(types.InlineKeyboardButton("📜 Логи действий", callback_data="adm:logs"))
+    kb.add(types.InlineKeyboardButton("🚪 Выйти из админки", callback_data="adm:exit"))
+    return kb
+
+
+def back_button(target="adm:menu"):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=target))
+    return kb
+
+
+def captains_menu_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("➕ Добавить капитана", callback_data="adm:captains:add"))
+    for u in get_captains():
+        kb.add(types.InlineKeyboardButton(f"➖ Убрать @{u}", callback_data=f"adm:captains:del:{u}"))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="adm:menu"))
+    return kb
+
+
+def news_admins_menu_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("➕ Добавить админа-новостника", callback_data="adm:news:add"))
+    for u in get_news_admins():
+        kb.add(types.InlineKeyboardButton(f"➖ Убрать @{u}", callback_data=f"adm:news:del:{u}"))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="adm:menu"))
+    return kb
+
+
+def roster_menu_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("➕ Добавить игрока", callback_data="adm:roster:add"))
+    for p in get_clan_roster():
+        kb.add(types.InlineKeyboardButton(f"⚙️ {p['nick']} ({p['role']})", callback_data=f"adm:roster:pick:{p['id']}"))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="adm:menu"))
+    return kb
+
+
+def roster_player_keyboard(pid):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("✏️ Изменить роль", callback_data=f"adm:roster:role:{pid}"))
+    kb.add(types.InlineKeyboardButton("➕ Прибавить K/D за матч", callback_data=f"adm:roster:kdadd:{pid}"))
+    kb.add(types.InlineKeyboardButton("🔁 Задать K/D заново", callback_data=f"adm:roster:kdset:{pid}"))
+    kb.add(types.InlineKeyboardButton("🗑 Удалить игрока", callback_data=f"adm:roster:delc:{pid}"))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="adm:roster"))
+    return kb
+
+
+def matches_menu_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("➕ Добавить матч", callback_data="adm:matches:add"))
+    for m in get_clan_matches()[:20]:
+        label = f"{m['opponent']} {m['score_us']}:{m['score_them']}"
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"adm:matches:pick:{m['id']}"))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="adm:menu"))
+    return kb
+
+
+def match_keyboard(mid):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("✏️ Соперник", callback_data=f"adm:matches:editf:{mid}:opponent"))
+    kb.add(types.InlineKeyboardButton("✏️ Дата", callback_data=f"adm:matches:editf:{mid}:match_date"))
+    kb.add(types.InlineKeyboardButton("✏️ Наш счёт", callback_data=f"adm:matches:editf:{mid}:score_us"))
+    kb.add(types.InlineKeyboardButton("✏️ Счёт соперника", callback_data=f"adm:matches:editf:{mid}:score_them"))
+    kb.add(types.InlineKeyboardButton("🗑 Удалить матч", callback_data=f"adm:matches:delm:{mid}"))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="adm:matches"))
+    return kb
+
+
+def format_applications_text():
+    apps = get_applications(15)
+    if not apps:
+        return "📥 Заявок пока нет."
+    lines = ["📥 <b>Последние заявки в клан</b> (последние 15):"]
+    for a in apps:
+        lines.append(
+            f"#{a['id']} · {a['created_at']} · {a['nick'] or '—'} (ID {a['game_id'] or '—'}) · "
+            f"роль: {a['role'] or '—'} · пояс: {a['timezone'] or '—'} · от @{a['from_username'] or '—'}"
+        )
+    return "\n".join(lines)
+
+
+def format_logs_text():
+    logs = get_admin_logs(20)
+    if not logs:
+        return "📜 Логов пока нет."
+    lines = ["📜 <b>Последние действия админов</b> (последние 20):"]
+    for l in logs:
+        who = f"@{l['actor_username']}" if l["actor_username"] and l["actor_username"] != "—" else str(l["actor_id"])
+        details = f" — {l['details']}" if l["details"] else ""
+        lines.append(f"{l['created_at']} · {who}: {l['action']}{details}")
+    return "\n".join(lines)
+
+
+@bot.message_handler(commands=["admin"])
+def cmd_admin(message):
+    uid = message.from_user.id
+    if uid in ADMIN_SESSIONS:
+        bot.reply_to(message, "Ты уже в режиме админа.", reply_markup=admin_menu_keyboard())
+        return
+    ADMIN_LOGIN_PENDING.add(uid)
+    if message.chat.type == "private":
+        bot.reply_to(message, "🔐 Введи пароль администратора:")
+    else:
+        bot.reply_to(
+            message,
+            "🔐 Введи пароль администратора следующим сообщением.\n"
+            "⚠️ Лучше сделать это в личке с ботом — здесь сообщение с паролем будет удалено, "
+            "но его на мгновение увидят все в чате.",
+        )
+
+
+@bot.message_handler(commands=["admin_exit"])
+def cmd_admin_exit(message):
+    uid = message.from_user.id
+    ADMIN_SESSIONS.discard(uid)
+    ADMIN_STATE.pop(uid, None)
+    ADMIN_LOGIN_PENDING.discard(uid)
+    bot.reply_to(message, "🚪 Вышел из режима админа.")
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user and m.from_user.id in ADMIN_LOGIN_PENDING and not (m.text or "").startswith("/"),
+    content_types=["text"],
+)
+def handle_admin_password(message):
+    uid = message.from_user.id
+    ADMIN_LOGIN_PENDING.discard(uid)
+    if message.text.strip() == ADMIN_PANEL_PASSWORD:
+        ADMIN_SESSIONS.add(uid)
+        log_admin_action(message.from_user.username, uid, "Вход в админ-панель")
+        bot.send_message(message.chat.id, "✅ Доступ разрешён. Панель администратора:", reply_markup=admin_menu_keyboard())
+    else:
+        bot.send_message(message.chat.id, "❌ Неверный пароль. Попробуй снова через /admin.")
+    if message.chat.type != "private":
+        try:
+            bot.delete_message(message.chat.id, message.message_id)
+        except Exception:
+            pass
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user and m.from_user.id in ADMIN_STATE and not (m.text or "").startswith("/"),
+    content_types=["text"],
+)
+def handle_admin_flow(message):
+    uid = message.from_user.id
+    state = ADMIN_STATE.get(uid)
+    if not state:
+        return
+    action = state["action"]
+    text = message.text.strip()
+    actor = message.from_user.username or str(uid)
+    chat_id = message.chat.id
+
+    if action == "captain_add":
+        username = text.lstrip("@").lower()
+        add_captain(username)
+        log_admin_action(actor, uid, "Добавлен капитан", f"@{username}")
+        ADMIN_STATE.pop(uid, None)
+        bot.send_message(chat_id, f"✅ @{username} теперь капитан.", reply_markup=captains_menu_keyboard())
+        return
+
+    if action == "news_add":
+        username = text.lstrip("@").lower()
+        add_news_admin(username)
+        log_admin_action(actor, uid, "Добавлен админ-новостник", f"@{username}")
+        ADMIN_STATE.pop(uid, None)
+        bot.send_message(
+            chat_id,
+            f"✅ @{username} теперь админ-новостник.\n"
+            f"Пусть напишет боту /start хотя бы раз в личку — иначе бот не сможет писать ему первым.",
+            reply_markup=news_admins_menu_keyboard(),
+        )
+        return
+
+    if action == "roster_add_nick":
+        state["data"]["nick"] = text
+        state["action"] = "roster_add_role"
+        bot.send_message(chat_id, "Какая роль у игрока? (например: Игрок, Капитан, Саппорт)")
+        return
+
+    if action == "roster_add_role":
+        nick = state["data"]["nick"]
+        role = text
+        pid = add_clan_player(nick, role)
+        log_admin_action(actor, uid, "Добавлен игрок в ростер", f"{nick} ({role})")
+        ADMIN_STATE.pop(uid, None)
+        bot.send_message(chat_id, f"✅ Игрок «{nick}» ({role}) добавлен в ростер (ID {pid}).", reply_markup=roster_menu_keyboard())
+        return
+
+    if action.startswith("roster_role_edit:"):
+        pid = int(action.split(":")[1])
+        set_clan_player_role(pid, text)
+        log_admin_action(actor, uid, "Изменена роль игрока", f"ID {pid} → {text}")
+        ADMIN_STATE.pop(uid, None)
+        bot.send_message(chat_id, "✅ Роль обновлена.", reply_markup=roster_menu_keyboard())
+        return
+
+    if action.startswith("roster_kd_add:"):
+        pid = int(action.split(":")[1])
+        parts = text.replace(",", " ").split()
+        if len(parts) != 2 or not all(p.lstrip("-").isdigit() for p in parts):
+            bot.send_message(chat_id, "Не понял. Введи два числа через пробел: килы смерти (например: 5 2)")
+            return
+        k, d = int(parts[0]), int(parts[1])
+        add_clan_player_kd(pid, k, d)
+        log_admin_action(actor, uid, "Прибавлены K/D игроку", f"ID {pid}: +{k}/+{d}")
+        ADMIN_STATE.pop(uid, None)
+        bot.send_message(chat_id, "✅ Статистика обновлена.", reply_markup=roster_menu_keyboard())
+        return
+
+    if action.startswith("roster_kd_set:"):
+        pid = int(action.split(":")[1])
+        parts = text.replace(",", " ").split()
+        if len(parts) != 2 or not all(p.lstrip("-").isdigit() for p in parts):
+            bot.send_message(chat_id, "Не понял. Введи два числа через пробел: килы смерти (например: 20 10)")
+            return
+        k, d = int(parts[0]), int(parts[1])
+        set_clan_player_kd(pid, k, d)
+        log_admin_action(actor, uid, "Заданы K/D игроку", f"ID {pid}: {k}/{d}")
+        ADMIN_STATE.pop(uid, None)
+        bot.send_message(chat_id, "✅ Статистика обновлена.", reply_markup=roster_menu_keyboard())
+        return
+
+    if action == "match_add_opponent":
+        state["data"]["opponent"] = text
+        state["action"] = "match_add_date"
+        bot.send_message(chat_id, "Дата матча? (например: 07.09.2026)")
+        return
+
+    if action == "match_add_date":
+        state["data"]["date"] = text
+        state["action"] = "match_add_scoreus"
+        bot.send_message(chat_id, "Счёт нашей команды (число)?")
+        return
+
+    if action == "match_add_scoreus":
+        if not text.lstrip("-").isdigit():
+            bot.send_message(chat_id, "Нужно число, попробуй ещё раз.")
+            return
+        state["data"]["score_us"] = int(text)
+        state["action"] = "match_add_scorethem"
+        bot.send_message(chat_id, "Счёт соперника (число)?")
+        return
+
+    if action == "match_add_scorethem":
+        if not text.lstrip("-").isdigit():
+            bot.send_message(chat_id, "Нужно число, попробуй ещё раз.")
+            return
+        d = state["data"]
+        score_them = int(text)
+        mid = add_clan_match(d["opponent"], d["date"], d["score_us"], score_them)
+        result = "победа" if d["score_us"] > score_them else "поражение"
+        log_admin_action(actor, uid, "Добавлен матч", f"{d['opponent']} {d['score_us']}:{score_them} ({result})")
+        ADMIN_STATE.pop(uid, None)
+        bot.send_message(
+            chat_id,
+            f"✅ Матч добавлен (ID {mid}): {d['opponent']} — {d['score_us']}:{score_them} ({result}).\n"
+            f"Счёт побед/поражений и винрейт на табло пересчитаются сами.",
+            reply_markup=matches_menu_keyboard(),
+        )
+        return
+
+    if action.startswith("match_edit:"):
+        _, mid_s, field = action.split(":")
+        mid = int(mid_s)
+        if field in ("score_us", "score_them"):
+            if not text.lstrip("-").isdigit():
+                bot.send_message(chat_id, "Нужно число, попробуй ещё раз.")
+                return
+            value = int(text)
+        else:
+            value = text
+        update_clan_match_field(mid, field, value)
+        log_admin_action(actor, uid, "Отредактирован матч", f"ID {mid}: {field} → {text}")
+        ADMIN_STATE.pop(uid, None)
+        bot.send_message(chat_id, "✅ Матч обновлён.", reply_markup=matches_menu_keyboard())
+        return
+
+
+def handle_admin_callback(call):
+    uid = call.from_user.id
+    data = call.data
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+
+    if uid not in ADMIN_SESSIONS:
+        bot.answer_callback_query(call.id, "🚫 Сначала войди в панель через /admin", show_alert=True)
+        return
+
+    actor = call.from_user.username or str(uid)
+
+    if data == "adm:menu":
+        bot.edit_message_text("🔐 Панель администратора:", chat_id, msg_id, reply_markup=admin_menu_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "adm:exit":
+        ADMIN_SESSIONS.discard(uid)
+        ADMIN_STATE.pop(uid, None)
+        bot.edit_message_text("🚪 Вышел из режима админа.", chat_id, msg_id)
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "adm:captains":
+        bot.edit_message_text("👑 Капитаны:", chat_id, msg_id, reply_markup=captains_menu_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "adm:captains:add":
+        ADMIN_STATE[uid] = {"action": "captain_add", "data": {}}
+        bot.send_message(chat_id, "Введи @юзернейм нового капитана:")
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("adm:captains:del:"):
+        username = data.split(":", 3)[3]
+        remove_captain(username)
+        log_admin_action(actor, uid, "Убран капитан", f"@{username}")
+        bot.edit_message_text(f"✅ @{username} больше не капитан.", chat_id, msg_id, reply_markup=captains_menu_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "adm:news":
+        bot.edit_message_text("📰 Админы-новостники:", chat_id, msg_id, reply_markup=news_admins_menu_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "adm:news:add":
+        ADMIN_STATE[uid] = {"action": "news_add", "data": {}}
+        bot.send_message(chat_id, "Введи @юзернейм нового админа-новостника:")
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("adm:news:del:"):
+        username = data.split(":", 3)[3]
+        remove_news_admin(username)
+        log_admin_action(actor, uid, "Убран админ-новостник", f"@{username}")
+        bot.edit_message_text(
+            f"✅ @{username} больше не админ-новостник.", chat_id, msg_id, reply_markup=news_admins_menu_keyboard()
+        )
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "adm:apps":
+        bot.edit_message_text(format_applications_text(), chat_id, msg_id, reply_markup=back_button())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "adm:roster":
+        bot.edit_message_text("🧑‍🤝‍🧑 Ростер клана:", chat_id, msg_id, reply_markup=roster_menu_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "adm:roster:add":
+        ADMIN_STATE[uid] = {"action": "roster_add_nick", "data": {}}
+        bot.send_message(chat_id, "Ник нового игрока?")
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("adm:roster:pick:"):
+        pid = int(data.split(":")[3])
+        p = get_clan_player(pid)
+        if not p:
+            bot.answer_callback_query(call.id, "Игрок не найден", show_alert=True)
+            return
+        text = f"🧍 {p['nick']} ({p['role']})\nКиллы: {p['kills']} | Смерти: {p['deaths']}"
+        bot.edit_message_text(text, chat_id, msg_id, reply_markup=roster_player_keyboard(pid))
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("adm:roster:role:"):
+        pid = int(data.split(":")[3])
+        ADMIN_STATE[uid] = {"action": f"roster_role_edit:{pid}", "data": {}}
+        bot.send_message(chat_id, "Введи новую роль:")
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("adm:roster:kdadd:"):
+        pid = int(data.split(":")[3])
+        ADMIN_STATE[uid] = {"action": f"roster_kd_add:{pid}", "data": {}}
+        bot.send_message(chat_id, "Введи прибавку килы и смерти через пробел (например: 5 2):")
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("adm:roster:kdset:"):
+        pid = int(data.split(":")[3])
+        ADMIN_STATE[uid] = {"action": f"roster_kd_set:{pid}", "data": {}}
+        bot.send_message(chat_id, "Введи килы и смерти через пробел (например: 20 10):")
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("adm:roster:delc:"):
+        pid = int(data.split(":")[3])
+        p = get_clan_player(pid)
+        remove_clan_player(pid)
+        log_admin_action(actor, uid, "Удалён игрок из ростера", p["nick"] if p else str(pid))
+        bot.edit_message_text("🗑 Игрок удалён.", chat_id, msg_id, reply_markup=roster_menu_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "adm:matches":
+        bot.edit_message_text("📊 Матчи:", chat_id, msg_id, reply_markup=matches_menu_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "adm:matches:add":
+        ADMIN_STATE[uid] = {"action": "match_add_opponent", "data": {}}
+        bot.send_message(chat_id, "Название команды соперника?")
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("adm:matches:pick:"):
+        mid = int(data.split(":")[3])
+        m = get_clan_match(mid)
+        if not m:
+            bot.answer_callback_query(call.id, "Матч не найден", show_alert=True)
+            return
+        label = "ПОБЕДА" if m["result"] == "win" else "ПОРАЖЕНИЕ"
+        text = f"⚔️ {m['opponent']} — {m['match_date']}\nСчёт: {m['score_us']}:{m['score_them']} ({label})"
+        bot.edit_message_text(text, chat_id, msg_id, reply_markup=match_keyboard(mid))
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("adm:matches:editf:"):
+        _, _, _, mid_s, field = data.split(":")
+        mid = int(mid_s)
+        ADMIN_STATE[uid] = {"action": f"match_edit:{mid}:{field}", "data": {}}
+        field_prompts = {
+            "opponent": "Новое название соперника?",
+            "match_date": "Новая дата матча? (например: 07.09.2026)",
+            "score_us": "Новый счёт нашей команды (число)?",
+            "score_them": "Новый счёт соперника (число)?",
+        }
+        bot.send_message(chat_id, field_prompts.get(field, "Введи новое значение:"))
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("adm:matches:delm:"):
+        mid = int(data.split(":")[3])
+        m = get_clan_match(mid)
+        remove_clan_match(mid)
+        log_admin_action(actor, uid, "Удалён матч", m["opponent"] if m else str(mid))
+        bot.edit_message_text("🗑 Матч удалён.", chat_id, msg_id, reply_markup=matches_menu_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "adm:logs":
+        bot.edit_message_text(format_logs_text(), chat_id, msg_id, reply_markup=back_button())
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
 
 
 # ====================== ПОДТВЕРЖДЕНИЯ ТЕКСТОМ ======================
@@ -819,6 +1554,10 @@ def text_take(message):
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     data = call.data
+
+    if data.startswith("adm:"):
+        handle_admin_callback(call)
+        return
 
     if data.startswith("ready:"):
         _, tid_s, rid_s = data.split(":")
@@ -994,10 +1733,38 @@ def handle_callback(call):
 WEBAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp")
 
 
+class WebAppHandler(SimpleHTTPRequestHandler):
+    """Раздаёт статический webapp/index.html и отдаёт живые данные ростера/матчей
+    из базы данных бота через /api/roster и /api/matches (JSON), чтобы мини-апп
+    обновлялся сам после изменений в /admin — без правки кода."""
+
+    def _send_json(self, payload):
+        import json
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.startswith("/api/roster"):
+            self._send_json(get_clan_roster())
+            return
+        if self.path.startswith("/api/matches"):
+            self._send_json(get_clan_matches())
+            return
+        super().do_GET()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
 def run_webapp_server():
     """Раздаёт статический webapp/index.html, чтобы Railway видел, что порт слушается."""
     port = int(os.getenv("PORT", "8080"))
-    handler = partial(SimpleHTTPRequestHandler, directory=WEBAPP_DIR)
+    handler = partial(WebAppHandler, directory=WEBAPP_DIR)
     server = ThreadingHTTPServer(("0.0.0.0", port), handler)
     print(f"Веб-сервер мини-приложения запущен на порту {port}, раздаю {WEBAPP_DIR}")
     server.serve_forever()
