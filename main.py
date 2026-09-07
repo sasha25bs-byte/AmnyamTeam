@@ -22,6 +22,15 @@ from telebot import types
 HARDCODED_BOT_TOKEN = ""  # <-- для быстрого локального теста, например "123456:ABC-..."
 BOT_TOKEN = os.getenv("BOT_TOKEN") or HARDCODED_BOT_TOKEN
 
+# ВАЖНО про Railway: без подключённого постоянного Volume файл базы данных
+# живёт только внутри контейнера и стирается при каждом новом деплое (git push).
+# Чтобы состав/заявки/ростер клана НЕ сбрасывались:
+#   1) В Railway: Settings проекта -> Volumes -> Add Volume, точку монтирования
+#      укажи, например, "/data".
+#   2) Задай переменную окружения DB_PATH="/data/rapira_bot.db" (путь ДОЛЖЕН быть
+#      внутри примонтированного Volume).
+# Без этого шага база будет продолжать сбрасываться при каждом обновлении кода —
+# это не баг бота, а особенность контейнеров без постоянного диска.
 DB_PATH = os.getenv("DB_PATH", "rapira_bot.db")
 DT_FORMAT = "%d.%m.%Y %H:%M"
 MILESTONES = (20, 15, 10, 5)
@@ -193,6 +202,15 @@ def init_db():
                 actor_id INTEGER,
                 action TEXT NOT NULL,
                 details TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS banned_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                reason TEXT,
+                banned_by TEXT,
                 created_at TEXT NOT NULL
             )"""
         )
@@ -531,6 +549,37 @@ def remove_clan_match(mid):
 # ---------- Заявки в клан (дубль истории — оригиналы всё равно летят в личку админам) ----------
 
 
+# ---------- Бан игроков (запрет подавать заявки через /набор) ----------
+
+
+def ban_user(user_id, username, reason, banned_by):
+    with db_lock, db_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO banned_users (user_id, username, reason, banned_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, (username or "").lstrip("@").lower(), reason or "", banned_by or "", datetime.now().strftime(DT_FORMAT)),
+        )
+        conn.commit()
+
+
+def unban_user(user_id):
+    with db_lock, db_conn() as conn:
+        conn.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def is_banned(user_id):
+    with db_lock, db_conn() as conn:
+        row = conn.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,)).fetchone()
+        return row is not None
+
+
+def get_banned_users():
+    with db_lock, db_conn() as conn:
+        rows = conn.execute("SELECT * FROM banned_users ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+
 def save_application(data, from_username, from_user_id):
     with db_lock, db_conn() as conn:
         cur = conn.execute(
@@ -731,19 +780,18 @@ def cmd_help(message):
         message,
         "👋 Я помогаю собирать команду на турниры Rapira Online.\n\n"
         "<b>/new</b> — создать турнир\n"
-        "<b>/list</b> — список активных турниров\n"
-        "<b>/edit</b> — изменить турнир\n"
         "<b>/cancel_tournament</b> — отменить турнир\n"
-        "<b>/find_players</b> — попросить админов найти прак/спарринг (напишу им в личку)\n"
         "<b>/новость</b> — в личке с ботом: искать прак / искать игрока (для капитанов)\n"
         "<b>/набор</b> — подать заявку в команду (в личке: через ЛС-анкету или мини-апп)\n"
-        "<b>/cancel</b> — прервать текущий ввод\n"
-        "<b>/admin</b> — панель администратора (по паролю)\n\n"
+        "<b>/cancel</b> — прервать текущий ввод\n\n"
         "Тегаю состав за 20/15/10/5 минут до старта и сам ищу замену, если кто-то не подтвердился.",
     )
 
 
 def start_application(message):
+    if message.from_user and is_banned(message.from_user.id):
+        bot.send_message(message.chat.id, "🚫 Ты не можешь подать заявку в клан.")
+        return
     APPLY_STATE[message.chat.id] = {"step": "nick", "data": {}}
     bot.send_message(
         message.chat.id,
@@ -772,32 +820,6 @@ def cmd_new(message):
     bot.reply_to(message, "Как называется турнир?")
 
 
-@bot.message_handler(commands=["list"])
-def cmd_list(message):
-    tournaments = get_active_tournaments(message.chat.id)
-    if not tournaments:
-        bot.reply_to(message, "Активных турниров нет. Создай через /new")
-        return
-    lines = []
-    for t in tournaments:
-        dt = datetime.fromisoformat(t["start_time"])
-        roster = get_roster(t["id"])
-        ready = sum(1 for r in roster if r["status"] == "confirmed")
-        lines.append(f"#{t['id']} «{t['name']}» — {dt.strftime(DT_FORMAT)} МСК ({ready}/{len(roster)} готовы)")
-    bot.reply_to(message, "\n".join(lines))
-
-
-@bot.message_handler(commands=["edit"])
-def cmd_edit(message):
-    if not require_captain(message):
-        return
-    tournaments = get_active_tournaments(message.chat.id)
-    if not tournaments:
-        bot.reply_to(message, "Активных турниров нет.")
-        return
-    bot.reply_to(message, "Какой турнир редактируем?", reply_markup=tournaments_keyboard(tournaments, "edit_pick"))
-
-
 @bot.message_handler(commands=["cancel_tournament"])
 def cmd_cancel_tournament(message):
     if not require_captain(message):
@@ -807,17 +829,6 @@ def cmd_cancel_tournament(message):
         bot.reply_to(message, "Активных турниров нет.")
         return
     bot.reply_to(message, "Какой турнир отменить?", reply_markup=tournaments_keyboard(tournaments, "cancel_pick"))
-
-
-@bot.message_handler(commands=["find_players"])
-def cmd_find_players(message):
-    if not require_captain(message):
-        return
-    if not get_news_admins():
-        bot.reply_to(message, "Список админов-новостников не настроен. Добавь через /admin.")
-        return
-    FIND_STATE[message.chat.id] = {"step": "team", "data": {}}
-    bot.reply_to(message, "Как называется команда?")
 
 
 @bot.message_handler(commands=["новость"])
@@ -1089,6 +1100,7 @@ def application_decision_keyboard(app_id):
         types.InlineKeyboardButton("✅ Одобрить", callback_data=f"app:approve:{app_id}"),
         types.InlineKeyboardButton("❌ Отклонить", callback_data=f"app:decline:{app_id}"),
     )
+    kb.add(types.InlineKeyboardButton("🚫 Отклонить и забанить", callback_data=f"app:ban:{app_id}"))
     return kb
 
 
@@ -1127,8 +1139,10 @@ def send_application(message, data):
     else:
         bot.send_message(
             message.chat.id,
-            "⚠️ Не получилось никому отправить заявку — капитаны и админы ещё не писали боту. "
-            "Попробуй написать в общий чат команды напрямую.",
+            "⚠️ Не получилось никому отправить заявку — капитаны и админы ещё не писали боту в личку "
+            "(или список капитанов/админов недавно сбросился из-за перезапуска бота на сервере). "
+            "Попробуй написать в общий чат команды напрямую, а капитанам стоит зайти в /admin и "
+            "проверить список капитанов/админов-новостников.",
         )
 
 
@@ -1150,16 +1164,29 @@ def handle_application_decision(call):
         bot.answer_callback_query(call.id, f"Эта заявка {label}", show_alert=True)
         return
 
-    status = "approved" if action == "approve" else "declined"
     decided_by = call.from_user.username or str(call.from_user.id)
-    update_application_status(app_id, status, decided_by)
-    log_admin_action(
-        call.from_user.username, call.from_user.id,
-        "Одобрена заявка" if status == "approved" else "Отклонена заявка",
-        f"#{app_id} {app['nick']}",
-    )
 
-    decided_line = f"\n\n{'✅ ОДОБРЕНА' if status == 'approved' else '❌ ОТКЛОНЕНА'} — @{decided_by}"
+    if action == "ban":
+        status = "declined"
+        update_application_status(app_id, status, decided_by)
+        if app["from_user_id"]:
+            ban_user(app["from_user_id"], app["from_username"], "Забанен при рассмотрении заявки", decided_by)
+        log_admin_action(
+            call.from_user.username, call.from_user.id,
+            "Отклонена заявка + бан",
+            f"#{app_id} {app['nick']} (@{app['from_username'] or '—'})",
+        )
+        decided_line = f"\n\n🚫 ОТКЛОНЕНА И ЗАБАНЕНА — @{decided_by}"
+    else:
+        status = "approved" if action == "approve" else "declined"
+        update_application_status(app_id, status, decided_by)
+        log_admin_action(
+            call.from_user.username, call.from_user.id,
+            "Одобрена заявка" if status == "approved" else "Отклонена заявка",
+            f"#{app_id} {app['nick']}",
+        )
+        decided_line = f"\n\n{'✅ ОДОБРЕНА' if status == 'approved' else '❌ ОТКЛОНЕНА'} — @{decided_by}"
+
     try:
         if call.message.content_type == "photo":
             bot.edit_message_caption(
@@ -1175,7 +1202,9 @@ def handle_application_decision(call):
 
     if app["from_user_id"]:
         try:
-            if status == "approved":
+            if action == "ban":
+                bot.send_message(app["from_user_id"], "🚫 Твоя заявка в клан отклонена. Ты не сможешь подавать заявки повторно.")
+            elif status == "approved":
                 bot.send_message(app["from_user_id"], "✅ Твоя заявка в клан одобрена! Скоро с тобой свяжутся.")
             else:
                 bot.send_message(app["from_user_id"], "❌ Твоя заявка в клан отклонена.")
@@ -1194,6 +1223,7 @@ def admin_menu_keyboard():
     kb.add(types.InlineKeyboardButton("🧑‍🤝‍🧑 Ростер клана", callback_data="adm:roster"))
     kb.add(types.InlineKeyboardButton("📊 Матчи", callback_data="adm:matches"))
     kb.add(types.InlineKeyboardButton("📜 Логи действий", callback_data="adm:logs"))
+    kb.add(types.InlineKeyboardButton("🚫 Забаненные", callback_data="adm:bans"))
     kb.add(types.InlineKeyboardButton("🚪 Выйти из админки", callback_data="adm:exit"))
     return kb
 
@@ -1287,6 +1317,27 @@ def format_logs_text():
         details = f" — {l['details']}" if l["details"] else ""
         lines.append(f"{l['created_at']} · {who}: {l['action']}{details}")
     return "\n".join(lines)
+
+
+def format_bans_text():
+    bans = get_banned_users()
+    if not bans:
+        return "🚫 Забаненных нет."
+    lines = ["🚫 <b>Забаненные пользователи</b>:"]
+    for b in bans:
+        who = f"@{b['username']}" if b.get("username") else str(b["user_id"])
+        reason = f" — {b['reason']}" if b.get("reason") else ""
+        lines.append(f"{b['created_at']} · {who}{reason}")
+    return "\n".join(lines)
+
+
+def bans_menu_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    for b in get_banned_users():
+        label = f"✅ Разбанить @{b['username']}" if b.get("username") else f"✅ Разбанить {b['user_id']}"
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"adm:unban:{b['user_id']}"))
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="adm:menu"))
+    return kb
 
 
 @bot.message_handler(commands=["admin"])
@@ -1648,6 +1699,19 @@ def handle_admin_callback(call):
         bot.answer_callback_query(call.id)
         return
 
+    if data == "adm:bans":
+        bot.edit_message_text(format_bans_text(), chat_id, msg_id, reply_markup=bans_menu_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("adm:unban:"):
+        target_id = int(data.split(":")[2])
+        unban_user(target_id)
+        log_admin_action(actor, uid, "Снят бан", str(target_id))
+        bot.edit_message_text(format_bans_text(), chat_id, msg_id, reply_markup=bans_menu_keyboard())
+        bot.answer_callback_query(call.id, "Разбанен")
+        return
+
     bot.answer_callback_query(call.id)
 
 
@@ -1923,6 +1987,14 @@ def run_webapp_server():
 
 if __name__ == "__main__":
     init_db()
+    if not os.getenv("DB_PATH"):
+        print(
+            "⚠️  ВНИМАНИЕ: DB_PATH не задан переменной окружения — база данных лежит в "
+            f"'{DB_PATH}' внутри контейнера. На Railway без подключённого Volume это "
+            "означает, что ВЕСЬ ростер, заявки, капитаны и админы обнулятся при следующем "
+            "деплое/рестарте. Подключи Volume в Railway и задай DB_PATH на путь внутри него "
+            "(например /data/rapira_bot.db), чтобы данные сохранялись."
+        )
     threading.Thread(target=background_loop, daemon=True).start()
     threading.Thread(target=run_webapp_server, daemon=True).start()
     print("Бот запущен, начинаю polling...")
