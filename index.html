@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Amnyam Team — Ростер</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Luckiest+Guy&family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #14170F;
+    --white: #FFFFFF;
+    --bg: #F3F6EC;
+    --green: #62C21D;
+    --green-dark: #3C8E12;
+    --green-pale: #E3F2D2;
+    --red: #E2472D;
+    --muted: #6E7A66;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: 'Nunito', sans-serif;
+    display: flex;
+    justify-content: center;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+
+  .app {
+    width: 100%;
+    max-width: 430px;
+    min-height: 100vh;
+    background: var(--bg);
+    position: relative;
+    overflow: hidden;
+    padding-bottom: 44px;
+  }
+
+  /* ---------- HEADER ---------- */
+
+  .header {
+    position: relative;
+    background: var(--white);
+    border-bottom: 3px solid var(--ink);
+    padding: 26px 20px 84px;
+    text-align: center;
+    overflow: hidden;
+  }
+
+  .header-wedge {
+    position: absolute;
+    top: 0; right: 0;
+    width: 140px;
+    height: 100px;
+    background: var(--ink);
+    clip-path: polygon(35% 0, 100% 0, 100% 100%);
+  }
+
+  .header-wedge-2 {
+    position: absolute;
+    bottom: -26px; left: -30px;
+    width: 130px;
+    height: 90px;
+    background: var(--green);
+    clip-path: polygon(0 0, 70% 20%, 100% 100%, 0% 100%);
+    opacity: 0.9;
+  }
+
+  .mascot {
+    width: 76px;
+    height: 76px;
+    margin: 4px auto 6px;
+    position: relative;
+    z-index: 2;
+  }
+
+  .wordmark {
+    font-family: 'Luckiest Guy', sans-serif;
+    font-size: 34px;
+    line-height: 1;
+    letter-spacing: 1px;
+    position: relative;
+    z-index: 2;
+    -webkit-text-stroke: 2px var(--ink);
+    paint-order: stroke fill;
+  }
+
+  .wordmark .a { color: var(--white); -webkit-text-stroke: 2px var(--ink); }
+  .wordmark .b { color: var(--green); -webkit-text-stroke: 2px var(--ink); }
+
+  .tagline {
+    font-weight: 700;
+    font-size: 12.5px;
+    color: var(--muted);
+    margin-top: 8px;
+    letter-spacing: 0.3px;
+    position: relative;
+    z-index: 2;
+  }
+
+  /* ---------- SCOREBOARD ---------- */
+
+  .scoreboard {
+    margin: -56px 20px 0;
+    position: relative;
+    z-index: 3;
+    background: var(--ink);
+    border-radius: 18px;
+    padding: 18px 16px 14px;
+    box-shadow: 0 6px 0 rgba(0,0,0,0.12);
+  }
+
+  .scoreboard-label {
+    font-size: 11.5px;
+    font-weight: 700;
+    color: #A9B79D;
+    text-align: center;
+    margin-bottom: 6px;
+  }
+
+  .scoreboard-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+  }
+
+  .score-block { text-align: center; flex: 1; }
+
+  .score-num {
+    font-family: 'Luckiest Guy', sans-serif;
+    font-size: 46px;
+    line-height: 1;
+  }
+
+  .score-num.win { color: var(--green); }
+  .score-num.loss { color: var(--red); }
+
+  .score-tag {
+    font-size: 11px;
+    font-weight: 700;
+    color: #A9B79D;
+    margin-top: 2px;
+  }
+
+  .score-divider {
+    font-family: 'Luckiest Guy', sans-serif;
+    font-size: 24px;
+    color: #3A4034;
+  }
+
+  .scoreboard-footer {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 2px dashed #2B3025;
+    font-size: 12.5px;
+    color: #A9B79D;
+    font-weight: 700;
+  }
+
+  .scoreboard-footer strong {
+    color: var(--green);
+    font-family: 'Luckiest Guy', sans-serif;
+    font-size: 15px;
+  }
+
+  /* ---------- SECTIONS ---------- */
+
+  .section { margin: 26px 20px 0; }
+
+  .section-title {
+    font-family: 'Luckiest Guy', sans-serif;
+    font-size: 20px;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    color: var(--ink);
+  }
+
+  .section-count {
+    font-size: 12.5px;
+    color: var(--muted);
+    font-family: 'Nunito', sans-serif;
+    font-weight: 700;
+  }
+
+  /* ---------- ROSTER ---------- */
+
+  .player-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+    padding: 10px 14px 10px 10px;
+    background: var(--white);
+    border-radius: 16px;
+    border: 3px solid var(--ink);
+  }
+
+  .player-avatar { width: 54px; height: 54px; flex-shrink: 0; }
+
+  .player-info { flex: 1; min-width: 0; }
+
+  .player-name {
+    font-family: 'Luckiest Guy', sans-serif;
+    font-size: 17px;
+    color: var(--ink);
+    letter-spacing: 0.3px;
+  }
+
+  .player-role {
+    font-size: 11.5px;
+    font-weight: 700;
+    color: var(--muted);
+    margin-top: 1px;
+  }
+
+  .player-stat {
+    text-align: center;
+    flex-shrink: 0;
+    background: var(--green-pale);
+    border: 2px solid var(--green-dark);
+    border-radius: 12px;
+    padding: 5px 10px;
+  }
+
+  .player-stat-num {
+    font-family: 'Luckiest Guy', sans-serif;
+    font-size: 18px;
+    color: var(--green-dark);
+    line-height: 1;
+  }
+
+  .player-stat-label {
+    font-size: 9px;
+    font-weight: 800;
+    color: var(--green-dark);
+    letter-spacing: 0.3px;
+  }
+
+  /* ---------- TOURNAMENTS ---------- */
+
+  .tournament-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 10px;
+    padding: 12px 14px;
+    background: var(--white);
+    border-radius: 14px;
+    border: 3px solid var(--ink);
+  }
+
+  .status-chip {
+    font-family: 'Luckiest Guy', sans-serif;
+    font-size: 11.5px;
+    padding: 5px 10px;
+    border-radius: 8px;
+    border: 2px solid var(--ink);
+    flex-shrink: 0;
+    letter-spacing: 0.3px;
+  }
+
+  .status-chip.upcoming { background: var(--white); color: var(--muted); }
+  .status-chip.win { background: var(--green); color: var(--white); }
+  .status-chip.loss { background: var(--red); color: var(--white); }
+
+  .tournament-info { flex: 1; min-width: 0; }
+
+  .tournament-name {
+    font-weight: 800;
+    font-size: 15px;
+  }
+
+  .tournament-meta {
+    font-size: 11.5px;
+    color: var(--muted);
+    font-weight: 700;
+    margin-top: 1px;
+  }
+
+  /* ---------- FOOTER ---------- */
+
+  .footer-note {
+    margin: 26px 20px 0;
+    padding: 14px;
+    background: var(--white);
+    border: 2px dashed #C7D2B8;
+    border-radius: 12px;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.5;
+    font-weight: 700;
+  }
+
+  .footer-note strong { color: var(--ink); }
+
+  /* ---------- ПОДАТЬ ЗАЯВКУ ---------- */
+
+  .apply-cta {
+    display: block;
+    margin: 26px 20px 0;
+    background: var(--ink);
+    color: var(--white);
+    text-align: center;
+    text-decoration: none;
+    font-family: 'Luckiest Guy', sans-serif;
+    font-size: 17px;
+    letter-spacing: 0.5px;
+    padding: 15px 16px;
+    border-radius: 14px;
+    border: 3px solid var(--green);
+    box-shadow: 0 5px 0 rgba(0,0,0,0.18);
+  }
+
+  .apply-cta:active {
+    transform: translateY(3px);
+    box-shadow: 0 2px 0 rgba(0,0,0,0.18);
+  }
+
+  .apply-hint {
+    text-align: center;
+    font-size: 11.5px;
+    font-weight: 700;
+    color: var(--muted);
+    margin: 8px 20px 0;
+  }
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <div class="header">
+    <div class="header-wedge"></div>
+    <div class="header-wedge-2"></div>
+    <div class="mascot">
+      <svg viewBox="0 0 100 100" width="100%" height="100%">
+        <path d="M50 8 C 46 8 44 14 46 20 C 40 22 36 28 36 30" stroke="#14170F" stroke-width="5" fill="none" stroke-linecap="round"/>
+        <ellipse cx="50" cy="58" rx="40" ry="34" fill="#62C21D" stroke="#14170F" stroke-width="4"/>
+        <ellipse cx="33" cy="42" rx="17" ry="20" fill="#FFFFFF" stroke="#14170F" stroke-width="4"/>
+        <ellipse cx="67" cy="42" rx="17" ry="20" fill="#FFFFFF" stroke="#14170F" stroke-width="4"/>
+        <circle cx="33" cy="45" r="6" fill="#14170F"/>
+        <circle cx="67" cy="45" r="6" fill="#14170F"/>
+        <path d="M28 72 Q50 90 72 72" stroke="#14170F" stroke-width="4" fill="none" stroke-linecap="round"/>
+      </svg>
+    </div>
+    <div class="wordmark">
+      <span class="a">A</span><span class="b">M</span><span class="a">N</span><span class="b">Y</span><span class="a">A</span><span class="b">M</span>&nbsp;<span class="a">T</span><span class="b">E</span><span class="a">A</span><span class="b">M</span>
+    </div>
+    <div class="tagline">RAPIRA ONLINE · СОСТАВ И СТАТИСТИКА</div>
+  </div>
+
+  <div class="scoreboard">
+    <div class="scoreboard-label">ОБЩИЙ СЧЁТ ТУРНИРОВ</div>
+    <div class="scoreboard-row">
+      <div class="score-block">
+        <div class="score-num win">3</div>
+        <div class="score-tag">ПОБЕДЫ</div>
+      </div>
+      <div class="score-divider">—</div>
+      <div class="score-block">
+        <div class="score-num loss">1</div>
+        <div class="score-tag">ПОРАЖЕНИЯ</div>
+      </div>
+    </div>
+    <div class="scoreboard-footer">
+      <span>ВИНРЕЙТ</span>
+      <strong>75%</strong>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">
+      Ростер
+      <span class="section-count" id="rosterCount"></span>
+    </div>
+    <div id="rosterList"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">
+      Турниры
+      <span class="section-count" id="tourCount"></span>
+    </div>
+    <div id="tourList"></div>
+  </div>
+
+  <a class="apply-cta" href="https://t.me/Ammnyamm_bot?start=apply">ПОДАТЬ ЗАЯВКУ В КЛАН</a>
+  <div class="apply-hint">Откроется чат с ботом — он спросит ник, ID, роль, скриншот статы и часовой пояс</div>
+
+  <div class="footer-note">
+    <strong>Тестовые данные.</strong> Ростер и турниры задаются в конце файла в массивах
+    <code>roster</code> и <code>tournaments</code> — правьте их, и список обновится.
+  </div>
+
+</div>
+
+<script>
+  // Простой генератор "жабко-аватара" — цвет тела меняется по индексу игрока
+  function makeAvatar(seed) {
+    const palettes = ["#62C21D", "#3C8E12", "#8FD84B"];
+    const body = palettes[seed % palettes.length];
+    return `
+      <svg viewBox="0 0 100 100" width="100%" height="100%">
+        <ellipse cx="50" cy="58" rx="40" ry="34" fill="${body}" stroke="#14170F" stroke-width="4"/>
+        <ellipse cx="33" cy="42" rx="16" ry="19" fill="#FFFFFF" stroke="#14170F" stroke-width="4"/>
+        <ellipse cx="67" cy="42" rx="16" ry="19" fill="#FFFFFF" stroke="#14170F" stroke-width="4"/>
+        <circle cx="33" cy="45" r="5.5" fill="#14170F"/>
+        <circle cx="67" cy="45" r="5.5" fill="#14170F"/>
+        <path d="M30 72 Q50 88 70 72" stroke="#14170F" stroke-width="4" fill="none" stroke-linecap="round"/>
+      </svg>`;
+  }
+
+  // ЗДЕСЬ ОБНОВЛЯЙТЕ ДАННЫЕ ВРУЧНУЮ
+
+  const roster = [
+    { name: "Rezz", role: "Игрок", wins: 2 },
+    { name: "Londyyy", role: "Игрок", wins: 1 },
+  ];
+
+  const tournaments = [
+    { name: "Мажор 2025", date: "тест-запись", status: "upcoming" }, // upcoming | win | loss
+  ];
+
+  const rosterList = document.getElementById('rosterList');
+  roster.forEach((p, i) => {
+    rosterList.innerHTML += `
+      <div class="player-card">
+        <div class="player-avatar">${makeAvatar(i)}</div>
+        <div class="player-info">
+          <div class="player-name">${p.name}</div>
+          <div class="player-role">${p.role}</div>
+        </div>
+        <div class="player-stat">
+          <div class="player-stat-num">${p.wins}</div>
+          <div class="player-stat-label">ПОБЕД</div>
+        </div>
+      </div>`;
+  });
+  document.getElementById('rosterCount').textContent =
+    roster.length + (roster.length === 1 ? " игрок" : " игрока");
+
+  const statusLabels = { upcoming: "СКОРО", win: "ПОБЕДА", loss: "ПОРАЖЕНИЕ" };
+  const tourList = document.getElementById('tourList');
+  tournaments.forEach(t => {
+    tourList.innerHTML += `
+      <div class="tournament-row">
+        <div class="status-chip ${t.status}">${statusLabels[t.status]}</div>
+        <div class="tournament-info">
+          <div class="tournament-name">${t.name}</div>
+          <div class="tournament-meta">${t.date}</div>
+        </div>
+      </div>`;
+  });
+  document.getElementById('tourCount').textContent =
+    tournaments.length + (tournaments.length === 1 ? " запись" : " записи");
+</script>
+
+</body>
+</html>
