@@ -9,6 +9,8 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 import telebot
 from telebot import types
@@ -871,8 +873,21 @@ def handle_callback(call):
 
 # ====================== ЗАПУСК ======================
 
+WEBAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp")
+
+
+def run_webapp_server():
+    """Раздаёт статический webapp/index.html, чтобы Railway видел, что порт слушается."""
+    port = int(os.getenv("PORT", "8080"))
+    handler = partial(SimpleHTTPRequestHandler, directory=WEBAPP_DIR)
+    server = ThreadingHTTPServer(("0.0.0.0", port), handler)
+    print(f"Веб-сервер мини-приложения запущен на порту {port}, раздаю {WEBAPP_DIR}")
+    server.serve_forever()
+
+
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=background_loop, daemon=True).start()
+    threading.Thread(target=run_webapp_server, daemon=True).start()
     print("Бот запущен, начинаю polling...")
     bot.infinity_polling(skip_pending=True)
