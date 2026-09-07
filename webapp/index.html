@@ -480,8 +480,8 @@
   <div class="apply-hint">Откроется чат с ботом — он спросит ник, ID, роль, скриншот статы и часовой пояс</div>
 
   <div class="footer-note">
-    Ростер и история матчей задаются в конце файла в массивах
-    <code>roster</code> и <code>matches</code> — правьте их, и список обновится.
+    Ростер и история матчей теперь редактируются через панель администратора бота
+    (команда <code>/admin</code>) — это приложение подтягивает данные автоматически.
   </div>
 
 </div>
@@ -523,80 +523,92 @@
       </svg>`;
   }
 
-  // ЗДЕСЬ ОБНОВЛЯЙТЕ ДАННЫЕ ВРУЧНУЮ
-
-  const roster = [
-    { name: "Rezz", role: "Игрок", kills: 0, deaths: 0 },
-    { name: "Londyyy", role: "Игрок", kills: 0, deaths: 0 },
-  ];
-
-  const matches = [
-    // { opponent: "Название команды", date: "07.09.2026", scoreUs: 13, scoreThem: 7, status: "win" }, // win | loss
-  ];
+  // Данные ростера и истории матчей теперь берутся с сервера бота (см. /admin в боте) —
+  // редактировать вручную здесь ничего не нужно, приложение само подтянет актуальные данные.
 
   function calcKD(kills, deaths) {
     if (deaths === 0) return kills > 0 ? kills.toFixed(2) : "0.00";
     return (kills / deaths).toFixed(2);
   }
 
-  const rosterList = document.getElementById('rosterList');
-  roster.forEach((p, i) => {
-    const kd = calcKD(p.kills, p.deaths);
-    const kdNeg = parseFloat(kd) < 1 ? "neg" : "";
-    rosterList.innerHTML += `
-      <div class="player-card">
-        <div class="player-avatar">${makeAvatar(i)}</div>
-        <div class="player-info">
-          <div class="player-name">${p.name}</div>
-          <div class="player-role">${p.role}</div>
-          <div class="player-kda">
-            <div class="kda-item">
-              <div class="kda-num">${p.kills}</div>
-              <div class="kda-label">КИЛЛЫ</div>
-            </div>
-            <div class="kda-item">
-              <div class="kda-num neg">${p.deaths}</div>
-              <div class="kda-label">СМЕРТИ</div>
-            </div>
-            <div class="kda-item">
-              <div class="kda-num ${kdNeg}">${kd}</div>
-              <div class="kda-label">КД</div>
+  function renderRoster(roster) {
+    const rosterList = document.getElementById('rosterList');
+    rosterList.innerHTML = "";
+    if (!roster.length) {
+      rosterList.innerHTML = `<div class="footer-note" style="margin-top:12px;">Ростер пока пуст.</div>`;
+    }
+    roster.forEach((p, i) => {
+      const kd = calcKD(p.kills, p.deaths);
+      const kdNeg = parseFloat(kd) < 1 ? "neg" : "";
+      rosterList.innerHTML += `
+        <div class="player-card">
+          <div class="player-avatar">${makeAvatar(i)}</div>
+          <div class="player-info">
+            <div class="player-name">${p.nick}</div>
+            <div class="player-role">${p.role}</div>
+            <div class="player-kda">
+              <div class="kda-item">
+                <div class="kda-num">${p.kills}</div>
+                <div class="kda-label">КИЛЛЫ</div>
+              </div>
+              <div class="kda-item">
+                <div class="kda-num neg">${p.deaths}</div>
+                <div class="kda-label">СМЕРТИ</div>
+              </div>
+              <div class="kda-item">
+                <div class="kda-num ${kdNeg}">${kd}</div>
+                <div class="kda-label">КД</div>
+              </div>
             </div>
           </div>
-        </div>
-      </div>`;
-  });
-  document.getElementById('rosterCount').textContent =
-    roster.length + (roster.length === 1 ? " игрок" : " игрока");
-
-  const matchStatusLabels = { win: "ПОБЕДА", loss: "ПОРАЖЕНИЕ" };
-  const matchList = document.getElementById('matchList');
-  if (matches.length === 0) {
-    matchList.innerHTML = `<div class="footer-note" style="margin-top:12px;">Матчей пока нет.</div>`;
-  } else {
-    matches.forEach(m => {
-      matchList.innerHTML += `
-        <div class="match-row">
-          <div class="status-chip ${m.status}">${matchStatusLabels[m.status]}</div>
-          <div class="match-info">
-            <div class="match-name">${m.opponent}</div>
-            <div class="match-meta">${m.date}</div>
-          </div>
-          <div class="match-score" style="color:${m.status === 'win' ? 'var(--green-dark)' : 'var(--red)'}">${m.scoreUs}:${m.scoreThem}</div>
         </div>`;
     });
+    document.getElementById('rosterCount').textContent =
+      roster.length + (roster.length === 1 ? " игрок" : " игрока");
   }
-  document.getElementById('matchCount').textContent =
-    matches.length + (matches.length === 1 ? " матч" : " матча");
 
-  // Общий счёт считается автоматически из истории матчей
-  const totalWins = matches.filter(m => m.status === 'win').length;
-  const totalLosses = matches.filter(m => m.status === 'loss').length;
-  const totalPlayed = totalWins + totalLosses;
-  const winrate = totalPlayed === 0 ? 0 : Math.round((totalWins / totalPlayed) * 100);
-  document.getElementById('scoreWins').textContent = totalWins;
-  document.getElementById('scoreLosses').textContent = totalLosses;
-  document.getElementById('scoreWinrate').textContent = winrate + '%';
+  const matchStatusLabels = { win: "ПОБЕДА", loss: "ПОРАЖЕНИЕ" };
+
+  function renderMatches(matches) {
+    const matchList = document.getElementById('matchList');
+    matchList.innerHTML = "";
+    if (matches.length === 0) {
+      matchList.innerHTML = `<div class="footer-note" style="margin-top:12px;">Матчей пока нет.</div>`;
+    } else {
+      matches.forEach(m => {
+        matchList.innerHTML += `
+          <div class="match-row">
+            <div class="status-chip ${m.result}">${matchStatusLabels[m.result]}</div>
+            <div class="match-info">
+              <div class="match-name">${m.opponent}</div>
+              <div class="match-meta">${m.match_date}</div>
+            </div>
+            <div class="match-score" style="color:${m.result === 'win' ? 'var(--green-dark)' : 'var(--red)'}">${m.score_us}:${m.score_them}</div>
+          </div>`;
+      });
+    }
+    document.getElementById('matchCount').textContent =
+      matches.length + (matches.length === 1 ? " матч" : " матча");
+
+    // Общий счёт считается автоматически из истории матчей
+    const totalWins = matches.filter(m => m.result === 'win').length;
+    const totalLosses = matches.filter(m => m.result === 'loss').length;
+    const totalPlayed = totalWins + totalLosses;
+    const winrate = totalPlayed === 0 ? 0 : Math.round((totalWins / totalPlayed) * 100);
+    document.getElementById('scoreWins').textContent = totalWins;
+    document.getElementById('scoreLosses').textContent = totalLosses;
+    document.getElementById('scoreWinrate').textContent = winrate + '%';
+  }
+
+  fetch('/api/roster')
+    .then(r => r.json())
+    .then(renderRoster)
+    .catch(() => renderRoster([]));
+
+  fetch('/api/matches')
+    .then(r => r.json())
+    .then(renderMatches)
+    .catch(() => renderMatches([]));
 
   // Переключение вкладок
   function switchTab(tab) {
